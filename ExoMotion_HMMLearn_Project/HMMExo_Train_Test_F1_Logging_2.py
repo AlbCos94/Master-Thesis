@@ -1,0 +1,934 @@
+# pylint: disable = missing-docstring, relative-import, logging-not-lazy
+#from joblib import Parallel, delayed
+import multiprocessing as mp
+from functools import partial
+import pdb # debugging library
+import pickle
+import os
+import datetime
+import logging
+import warnings
+import time
+import argparse
+import csv
+import sys
+import re
+from operator import itemgetter, add
+from sklearn.metrics import f1_score
+from sklearn.metrics import classification_report
+import numpy as np
+from hmmlearn.hmm import GaussianHMM
+#from toolkit.hmm.impl_hmmlearn import GaussianHMM
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import MinMaxScaler
+
+from Component import ArgParseError, Component, Field, getListIdxFromName
+import Motion_Datareader_Train_Test_10 as Datareader
+import coloring as col
+from TrainingStatistics import TrainingStatistics
+from toolkit.hmm.base import Classifier as HMMClassifier
+
+import compareLikelihoods as compLike
+
+
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+''' General documentation
+HMMExo_Train_Test is used to train an HMM-based model to predict/detect motions
+performed by an exoskeleton user. Data from the internal sensors of the
+exo (collected into windows by Motion_Datareader_Train_Test) is used to
+train the model.
+Stratified k-fold cross validation is used to train and evaluate several
+models. The model with the highest prediction rate is selected and saved
+for later (online) usage.
+HMMExo_Train_Test offers to select the testpersons and modalities for
+which the model is trained.
+
+
+For usage instructions refer to the README or run this script with -h.
+'''
+
+''' Parameters for HMM '''
+NUM_STATES = 14
+NUM_FOLDS = 5 # to train and test
+MAX_FITTING_TRIES = 10
+#windowsmotion = None
+
+''' Parameters for modular input '''
+
+# Components of 'exo1'
+ZMD1_COMP = Component('ZMD', 1, 8, [])  # name, numSensors, valuesPerSensor
+IMU1_COMP = Component('IMU', 1, 3, [])
+JA1_COMP = Component('JA', 1, 4, [])  # JointAngle
+JT1_COMP = Component('JT', 1, 4, [])  # JointTorque
+
+
+# Components of 'exo2'
+# ZMD
+X_FIELD = Field('x', 0)  # name, begin (inclusive start index)
+Y_FIELD = Field('y', 1)
+Z_FIELD = Field('z', 2)
+ZMD2_COMP = Component('ZMD', 7, 3, fields=[X_FIELD, Y_FIELD, Z_FIELD])
+# IMU
+LIN_ACC_COMP = Component('l', 3, 3, fields=[]) # LinearAcceleration
+#changed 4 to 9
+#QUATERNION_COMP = Component('q', 3, 4, fields=[]) # Quaternion
+QUATERNION_COMP = Component('q', 3, 9, fields=[]) # Quaternion
+#change 7 to
+#IMU2_COMP = Component('IMU', 3, 7, components=[QUATERNION_COMP, LIN_ACC_COMP])
+IMU2_COMP = Component('IMU', 3, 12, components=[QUATERNION_COMP, LIN_ACC_COMP]) # --> each IMU : 3 accelerations + 9 values of the rotation matrix
+# Euler Angles
+EULER_COMP = Component('e', 3, 3, fields=[]) # --> each IMU : 3 euler angles
+#changed 10 to 15
+#IMU3_COMP = Component('IMU', 3, 10, components=[QUATERNION_COMP, LIN_ACC_COMP, EULER_COMP])
+IMU3_COMP = Component('IMU', 3, 15, components=[QUATERNION_COMP, LIN_ACC_COMP, EULER_COMP]) # we have 3 IMUs, each one gives 15 values
+
+                                                                                            # each IMU : 3 accelerations + 9 values of the rotation matrix + 3 euler angles
+# Component of 'exo2moment'
+MOMENT_COMP = Component('Moment', 1, 3, fields=[X_FIELD, Y_FIELD, Z_FIELD]) # it is like we have a sensor that calculates the moment on the knee and provides 3 values
+
+
+# List of available exo versions
+EXO1 = Component('exo1', 1, 19, components=[ZMD1_COMP, IMU1_COMP, JA1_COMP, JT1_COMP])
+#changes 42 to 57
+#EXO2 = Component('exo2', 1, 42, components=[ZMD2_COMP, IMU2_COMP])
+EXO2 = Component('exo2', 1, 57, components=[ZMD2_COMP, IMU2_COMP])
+#cvhanged 51 to 66
+#EXO2_EULER = Component('exo2euler', 1, 51, components=[ZMD2_COMP, IMU3_COMP])
+#21 + 9 + 9+27
+
+
+# CURRENT VERSION --> exo2euler
+EXO2_EULER = Component('exo2euler', 1, 66, components=[ZMD2_COMP, IMU3_COMP]) # in total 1 exoskelton = 3 IMUs * ( 3 accels + 9 values rotation matrix + 3 euler angles ) +
+
+
+#Version with the moment feature
+EXO2_MOMENT = Component('exo2moment', 1, 3, components=[MOMENT_COMP])
+
+
+VERSIONS = [EXO1, EXO2, EXO2_EULER, EXO2_MOMENT] # 7 ZMD * ( 3 forces ) = 66 values
+
+
+''' File name parameters '''
+HMM_FILE = 'HMMBestTrained.npy'
+SCALER_FILE = 'Scaler.pkl'
+
+
+def main():
+    # track the run time
+    startTime = time.time()
+    modelDir = os.path.join(args.basepath, 'MotionPrediction', args.test_model)
+    test_only = bool(args.test_model)
+    writeDir = getWriteDir(args.basepath, args.testpersons, args.modalities, test_only)
+
+
+    # 'remove files of comparison'
+    for person in args.testpersons:
+        testperson = args.testpersons[0]
+        file_path_comparison = Datareader.BASEPATH + "/" +"ID"+str(testperson)
+
+        if os.path.exists(file_path_comparison+"/"+"Comparison_predicted_y.txt"):
+            os.remove(file_path_comparison+"/"+"Comparison_predicted_y.txt")
+
+        if os.path.exists(file_path_comparison+"/"+"Comparison_predicted_y.csv"):
+            os.remove(file_path_comparison+"/"+"Comparison_predicted_y.csv")
+
+        if os.path.exists(file_path_comparison+"/"+"Results_comparison.txt"):
+            os.remove(file_path_comparison+"/"+"Results_comparison.txt")
+
+        if os.path.exists(file_path_comparison+"/"+"score_values.csv"):
+            os.remove(file_path_comparison+"/"+"score_values.csv")
+    # end 'remove files of comparison'
+
+
+    global NUM_STATES
+    NUM_STATES = args.states
+    print ("number of states: " + str(NUM_STATES))
+    logging.info(NUM_STATES)
+    # windows contains the keys 'X' and 'y', where X contains the data and y the motion label of the
+
+    # window. Read only the columns selected via command-line input. --> windows are created depending on the data we have chosen ( persons, modality (IMU. FSy ...) and motions (backard, forwards..)
+    windows = readWindows(args.basepath, args.testpersons,
+                          args.exoversion, args.modalities, args.motions)
+    # scale windows
+    scale(windows, writeDir, modelDir, test_only)
+
+    if test_only:
+        # only do testing
+        statistics = testOnly(windows, modelDir)
+    else:
+        # train models and select the best one
+        hmmFile, statistics = trainAndTest(windows)
+        saveBestHmm(hmmFile, statistics, writeDir)
+    createLogFiles(writeDir, statistics)
+
+    # end time
+    endTime = time.time()
+    #duration of program
+    duration = endTime - startTime
+
+    col.printout("Start time of program: {} sec\n".format(startTime))
+    col.printout("End time of program: {} sec\n".format(endTime))
+    col.printout("Duration of program: {} sec\n".format(duration))
+
+    logging.info("Start time of program: {} sec\n".format(startTime))
+    logging.info("End time of program: {} sec\n".format(endTime))
+    logging.info("Duration of program: {} sec\n".format(duration))
+
+
+
+    """"" DISABLE --> (SOFTMAX)
+    # ADDED --> print read csv comparison and print results
+
+    motions_order= list(map(itemgetter(0),hmmFile[0])) # order of the motion labels in the csv file
+
+    #motions = list(map(itemgetter(0), scores))
+
+    std_user = compLike.CLikelihoods_analysis(str(args.testpersons[0]), motions_order)
+
+    Directory = Datareader.BASEPATH + "/" + "ID"+str(testperson)
+
+    std_user.read_csv( Directory+ "/" + "score_values.csv" )
+
+    std_user.print_results(Directory)
+
+    # end ADDED
+    """""
+
+
+'''
+Filter the motions in X and y by removing all windows whose label is
+listed in one of the following files:
+BASEPATH/Invalid_Motions.csv
+BASEPATH/{testperson}/Short_Recordings.csv
+BASEPATH/{testperson}/EMG/Invalid_Recodings.txt
+If --motions is specified, remove all motions that are not mentioned
+'''
+def filterMotions(X, y, testperson, basepath, prefixes):
+    
+    # get short/invalid motions
+    falseMotions = getFalseMotions(testperson, basepath)
+    # expand prefixed in selectedMotions
+    # filter
+    #windowsmotionzip = zip(X, y)
+    #windowsmotionzip[:] = [(x, (label,motion)) for (x, (label, motion)) in windowsmotionzip
+    #              if not motion in falseMotions
+    #              and (not prefixes or prefixes and isSubstring(motion, prefixes))]
+    #X[:], y[:] = zip(*windowsmotionzip) if windowsmotionzip else ([], [])
+    #global windowsmotion
+    #windowsmotion = zip(*y)[1]
+    windows = zip(X, y)
+    windows[:] = [(x, label) for (x, (label, motion)) in windows
+                  if not motion in falseMotions
+                  and (not prefixes or prefixes and isSubstring(motion, prefixes))]
+    X[:], y[:] = zip(*windows) if windows else ([], [])
+
+
+def isSubstring(string, strList):
+    """ Return true if any of the strings in strList is a substring of string. """
+    for substring in strList:
+        if substring in string:
+            return True
+    return False
+
+'''
+Return all invalid and short motions for the specified testperson name.
+'''
+def getFalseMotions(testperson, basepath):
+    invMotions = readInvalidMotions(testperson, basepath)
+    shortRecordings = readShortRecordings(testperson, basepath)
+    invRecordings = readInvalidRecordings(testperson, basepath)
+    return list(set(invMotions + shortRecordings + invRecordings))
+
+def readInvalidMotions(testperson, basepath):
+    filename = os.path.normpath(basepath + '/' + 'Invalid_Motions.csv')
+    motions = []
+    if os.path.exists(filename):
+        with open(filename) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row['Testperson'] == testperson:
+                    motions.append(row['Motion'])
+    return motions
+
+def readShortRecordings(testperson, basepath):
+    filename = os.path.normpath(basepath + '/' + testperson + '/Short_Recordings.csv')
+    motions = []
+    if os.path.exists(filename):
+        with open(filename) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                motions.append(row['Motion'])
+    return motions
+
+def readInvalidRecordings(testperson, basepath):
+    filename = os.path.normpath(basepath + '/' + testperson + '/EMG/Invalid_Recodings.txt')
+    motions = []
+    if os.path.exists(filename):
+        with open(filename) as f:
+            for line in f:
+                line = line.strip()
+                # B1_mE_LX_001 -> B1_mE_L1_001, B1_mE_L2_001
+                motions += [line.replace('X', '1'), line.replace('X', '2')]
+    return motions
+
+def parseArgs():
+    ''' parse command-line arguments '''
+    parser = argparse.ArgumentParser()
+    # add relevant arguments to the parser
+    parser.add_argument('-b', '--basepath',
+                        help='folder where all the experiment data lies'
+                        + ' The testperson folders are subfolders of BASEPATH.'
+                        + ' Possible names for testperson folders are: '
+                        + str([name + 'xy' for name in Datareader.TESTPERSONS])
+                        + ' for new data or "SegmentedData_Sorted*" for old data.',
+                        default=Datareader.BASEPATH)
+    parser.add_argument('-t', '--testpersons', help='Select the testpersons '
+                        + 'whose data is used to train the HMM. Use only integers.'
+                        + ' If -t is not specified, all testpersons are selected.'
+                        + ' Use "-t 1,3,5" to select the testpersons 1, 3 and 5. Leading zeros '
+                        + 'do not need to be added to the number, "-t 1" for example will select '
+                        + 'a testperson named "ID01" or "Proband 00001".',
+                        type=lambda s: [int(item) for item in s.split(',')])
+    parser.add_argument('-v', '--exoversion', help='Select the exo version '
+                        + 'with wich the data was created. [exo1|exo2|exo2euler|exo2moment]',
+                        default=Datareader.EXO_STD)
+    parser.add_argument('modalities', nargs='*',
+                        type=lambda s: [item for item in s.split('=')],
+                        help='Select the modalities for training the HMM. '
+                        + '"ZMD" selects all ZMD values, "ZMD=xz" selects '
+                        + 'the x and z values of all ZMD sensors and '
+                        + '"ZMD=1x,2,3y" selects the x value of the first '
+                        + 'sensor, the y value of the third sensor and all '
+                        + 'values of the second sensor. Usage with IMU is '
+                        + 'similiar: possible values are "l" for Linear'
+                        + 'Accelerations and "q" for Quaternion. '
+                        + ' "Moments" selects My, My Mz moments in the knee'
+                        + ' "Moments=2z" selects the z value of the second sensor')
+    parser.add_argument('-m', '--motions', help='Select the motions labels for which the HMM is '
+                        + 'trained. If -m is not specified, all labels are selected.'
+                        + ' Use "-m B1,B2_oE" for example to select all motions who have B1 or '
+                        + 'B2_oE somewhere in their name. Or use "-m mE,B3_oE_L2" to select all '
+                        + 'motion with the exo (mE) as well as all motions starting with B3_oE_L2.',
+                        type=lambda s: [item for item in s.split(',')])
+    parser.add_argument('-l', '--loglevel', default='WARNING',
+                        help='Logging level [debug, info, warning]')
+    parser.add_argument('-s', '--states', default=14, type=int,
+                        help='Select number of states')
+    parser.add_argument('--test-model', help='Test the existing model that was trained at the'
+                        + 'specified datetime.', default='')
+    parser.add_argument('-f', '--filename', help='Name of logging file.', default='Test')
+
+    return parser.parse_args()
+
+def initLogging(loglevel):
+    ''' Initialize logging. '''
+    numeric_level = getattr(logging, loglevel.upper(), None)
+    if not isinstance(numeric_level, int):
+        raise ValueError('Invalid log level: %s' % loglevel)
+    #logging.basicConfig(format='%(levelname)s:%(message)s', level=numeric_level)
+    if args.filename == "Test": #loggin file, it is checked
+        col.printout("You have to insert a filename!", col.RED)
+        sys.exit()
+    else:
+        logFileName = args.filename + '.txt'
+        print("results file: " + logFileName)
+
+    logging.basicConfig(filename=logFileName, filemode='w', format='%(message)s', level=numeric_level) # REMOVED logging to a file --> to record logging events in a file --> (level --> debug, info and warning)
+
+    #logging.basicConfig(filename=logFileName, filemode='w', format='%(message)s',level=logging.DEBUG)
+
+    #logging.basicConfig(filename=logFileName, filemode='w', format='%(message)s', level=logging.DEBUG)
+
+
+    return logging.getLogger(__name__)
+
+def selectColumns(exoversion, modalities):
+    """ Decide which window columns (aka which feature vector) to use
+
+    :param exoversion:
+    :param modalities:
+    :return: columns
+
+    >>> selectColumns('exo1', [])
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+    >>> selectColumns('exo2', [['ZMD']])  # 7 sensors, each yielding 3 values
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    >>> selectColumns('exo2', [['ZMD', 'x']])  # x values of all 7 sensors
+    [0, 3, 6, 9, 12, 15, 18]
+    >>> selectColumns('exo2', [['ZMD', '1']])  # all values of first sensor
+    [0, 1, 2]
+    >>> selectColumns('exo2', [['ZMD', '1x,2,3y']])
+    [0, 3, 4, 5, 7]
+    >>> selectColumns('exo2', [['ZMD', '1x']]) # x value of first sensor
+    [0]
+    >>> selectColumns('exo2euler', [['IMU', '1l']])
+    []
+
+    """
+    exo = VERSIONS[getListIdxFromName(exoversion, VERSIONS)]
+    columns = []
+    for mod in modalities:
+        try:
+            comp = exo.getComponent(mod[0])
+            if len(mod) == 1:
+                columns += comp.getAll()
+                continue
+
+            # extract the desired sub-components, fields and sensors
+            subs = mod[1].split(',')
+            for sub in subs:
+                match = re.match(r'[0-9]+', sub)
+                if match:
+                    sensor = int(match.group()) - 1
+                    sub = sub[len(match.group()):]
+                else:
+                    sensor = None
+                if not sub:
+                    # get all values for this sensor
+                    columns += comp.getFromSensor(sensor)
+                    continue
+                # the remaining entries in sub should be fields or components
+                for char in sub:
+                    columns += comp.getPartFromSensor(char, sensor)
+        except (ArgParseError, ValueError):
+            # catch ValueError in order to omit traceback that is not helpful for the user
+            sys.tracebacklimit = 0
+            raise
+    # if no modalities where selected, use all values
+    if not columns:
+        columns = exo.getAll()
+    # sort the columns and make them unique
+    return sorted(list(set(columns)))
+
+def readWindows(basepath, testpersons, exoversion, modalities, motions):
+    '''
+    Read windows in npy and pkl files for all testpersons in basepath.
+
+    Returns a tuple of a dictionary (windows) and a scaler instance. The windows dictionary's keys
+    are the testperson names and whose values are dictionaries with the keys 'X' and 'y'.
+    windows[testperson]['X'] is a list of numpy arrays where each array represents one window and
+    each row in an array is the sensor data at one timestamp.
+    windows[testperson]['y'] is numpy array of strings where each string is the label of the
+    corresponding window in 'X'.
+    '''
+    windows = {}
+    # select the columns
+    columns = selectColumns(exoversion, modalities)
+    visitedTestpersons = set([])
+    # read the data
+    for testperson in sorted(os.listdir(basepath)):
+        if (not os.path.isdir(basepath + '/' + testperson)
+                or not Datareader.isTestpersonDir(testperson)):
+            continue
+        personNr = Datareader.getTestpersonNumber(testperson)
+        if testpersons and personNr not in testpersons:
+            continue
+        try:
+            readWindowsForTestperson(basepath, testperson, motions, windows, columns)
+            visitedTestpersons.add(personNr)
+        except IOError:
+            continue
+
+    #pdb.set_trace()
+    if not windows:
+        col.printout('There are no valid windows for the specified testpersons!\n', col.RED)
+        sys.exit(1)
+
+    # check whether windows for all specified testpersons were found
+    if testpersons and not visitedTestpersons == set(testpersons):
+        col.printout('No windows could be found for the following testperson IDs: '
+                     + '{}.\n'.format(list(set(testpersons) - visitedTestpersons))
+                     + 'Please move the data to an appropriate folder and run '
+                     + 'Motion_Datareader_Train_Test.py on it!\n', col.RED)
+        sys.exit(1)
+    return windows
+
+def readWindowsForTestperson(basepath, testperson, motions, windows, columns):
+    dirpath = os.path.normpath(basepath + '/' + testperson+ '/MotionPrediction')
+    # Read sensor values of all windows
+    xFile = np.load(dirpath + '/ExoMotions_X_Train_Test_{}.npy'.format(testperson))
+    XNew = []
+    #i = 0
+
+    for x in xFile:
+        # shape of x: (number of timestamps, number of sensor values)
+        x = np.array(x, 'float32')
+        # only use the selected columns (aka sensor modalities)
+        #print columns
+        #print max(columns)
+        #print x.shape[1]
+        #print testperson
+        #print i
+        #print x
+        #i +=1
+        assert max(columns) < x.shape[1]
+
+        #print x
+        x = x[:, columns]
+        #print testperson
+        #print motions
+        #print x
+        #print x[10]
+        #print x[10][0]
+        #print columns
+        #sys.exit()
+        XNew.append(x)
+    # Read motions for all windows
+    with open(dirpath + '/ExoMotions_y_Train_Test_{}.pkl'.format(testperson), 'rb') as yFile:
+        yNew = pickle.load(yFile)
+        #print yNew[23592]
+    # filter short/invalid motions from X and y
+
+    filterMotions(XNew, yNew, testperson, basepath, motions)
+    if yNew:
+        # save windows seperately for each testperson
+        windows[testperson] = {'X': XNew, 'y': np.array(yNew)}
+
+def generateFoldIndices(numFolds, windows):
+    indices = {}
+    skf = StratifiedKFold(numFolds, shuffle=True)
+    for testperson in windows:
+        idxGenerator = skf.split(windows[testperson]['X'], windows[testperson]['y'])
+        indices[testperson] = [idxTuple for idxTuple in idxGenerator]
+    return indices
+
+def splitData(train, test, windows):
+    """
+    Split the windows into train and test datasets.
+
+    Return a tuple (trainWindows, testWindows). Each of the dictionaries contains entries for the
+    data ('X') and the labels ('y').
+
+    :param train: list of indexes in windows['y']/windows['X'] that belong to the trainings dataset
+    :param test: list of indexes in windows['y']/windows['X'] that belong to the test dataset
+    :param windows: dictionary with the entries 'X' (list of sensor data for each window) and 'y'
+                    (window labels)
+    """
+    # Split data into training and test data for this lap
+    trainWindows = {}
+    # X[train] not possible because X is list of numpy arrays and not a numpy array itself
+    trainWindows['X'] = [windows['X'][idx] for idx in train]
+    trainWindows['y'] = windows['y'][train]
+    testWindows = {}
+    testWindows['X'] = [windows['X'][idx] for idx in test]
+    testWindows['y'] = windows['y'][test]
+
+    return (trainWindows, testWindows)
+
+def createScaler(windows):
+    """ Returns a scaler fitted to the windows. """
+    # Create new scaler
+    scaler = MinMaxScaler(feature_range=(-1, 1))
+    # Compute the minimum and maximum to be used for later scaling
+    # Min/Max is computed for every type of sensor value, eg. ZMD0, IMU1 etc.
+    X = reduce(add, [subjectWindows['X'] for subjectWindows in windows.values()])
+    try:
+        scaler.fit(np.vstack(X))
+    except ValueError:
+        col.printout('Scaling of windows not possible, there are no valid windows!\n', col.RED)
+        sys.exit(1)
+    return scaler
+
+def readScaler(readDir):
+    """ Reads a scaler from file and returns it. """
+    filename = os.path.join(readDir, SCALER_FILE)
+    if not os.path.exists(filename):
+        col.printout('No scaler file found!\n', col.RED)
+        col.printout('Maybe the data in {} is from a test-only run.\n'.format(readDir), col.RED)
+        sys.exit(1)
+    with open(filename, 'rb') as scalerFile:
+        scaler = pickle.load(scalerFile)
+    return scaler
+
+def scaleWindows(windows, scaler):
+    """ Scale and save the X data in train- and testWindows. """
+    # Scaling features of val according to feature_range.
+    for testperson, oldWindows in windows.items():
+        windows[testperson]['X'] = [scaler.transform(val) for val in oldWindows['X']]
+
+def scale(windows, writeDir, readDir, test_only):
+    # obtain scaler
+    if test_only:
+        scaler = readScaler(readDir)
+        featureSize = windows.values()[0]['X'][0].shape[1]
+        if scaler.scale_.size != featureSize:
+            # shape of the original scaled data is different from the received data
+            col.printout('Received data has a different number of features than the '
+                         + 'training data!\n', col.RED)
+            col.printout('Did you train with the same sensor combination you are using now?\n',
+                         col.RED)
+            sys.exit(1)
+    else:
+        scaler = createScaler(windows)
+    # do the actual scaling
+    scaleWindows(windows, scaler)
+    # save scaler if necessary
+    if not test_only:
+        saveScaler(writeDir, scaler)
+
+def get_classifier():
+    model = GaussianHMM(n_components=NUM_STATES,
+                                covariance_type="diag", n_iter=100)
+    return HMMClassifier(model, n_jobs=4)
+
+def trainModel(trainWindows):
+    # fully connected hmms. Use one hmm for each possible motion.
+    #classifier = get_classifier()
+
+    #curr = time.time()
+    #print args.filename
+    #fileh = logging.FileHandler(args.filename  + str(curr) + '.txt' , 'a')  # your path + time
+    #formatter = logging.Formatter('%(message)s')  # your formatter
+    #fileh.setFormatter(formatter)
+
+    #log = logging.getLogger()  # root logger
+    #for hdlr in log.handlers[:]:  # remove all old handlers
+    #    log.removeHandler(hdlr)
+    #log.addHandler(fileh)  # set the new handler
+
+    unique_labels = list(set(trainWindows['y'])) # dictionary with which I can acces to al
+    hmms = [(label, GaussianHMM(n_components=NUM_STATES,
+                                covariance_type="diag", n_iter=100))
+            for label in unique_labels]
+    #hmms[:] = [hmm for hmm in hmms if trainHMM(hmm, trainWindows)]
+
+    #joblib
+    #truehmms = Parallel(n_jobs=-2)(delayed(trainHMM)(hmm, trainWindows) for hmm in hmms)
+
+    #in-built multiprocessing
+    cores = mp.cpu_count()
+    print "Using "+str(cores-1) + " cores for multiprocessing."
+    m = mp.Manager()
+    p = mp.Pool(processes=cores-1) # mp --> multiprocessing
+    truehmms = p.map(partial(trainHMM, trainWindows), hmms)
+    p.close()
+    p.join()
+
+    #print truehmms
+    hmms[:] = truehmms
+    # make sure that not all HMMs were deleted
+    assert hmms
+    return hmms
+
+def trainHMM(trainWindows, inp):
+    label, hmm = inp
+    X_train_label = [val for idx, val in enumerate(trainWindows['X'])
+                     if trainWindows['y'][idx] == label]
+          
+    # try several times to fit the model, hoping for a succesful initialization
+    for tryNr in range(MAX_FITTING_TRIES):
+        try:
+            # fit: training HMM
+            hmm.fit(X_train_label)
+            logger.debug('Successfully fitted HMM to model for '
+                         + 'label {} at try {}'.format(label, tryNr))
+            return (label, hmm)
+        except ValueError:
+            logger.debug('Could not fit HMM to model for '
+                         + 'label {} at try {}'.format(label, tryNr))
+    # no HMM could be fitted to this label's data
+    logger.warning('Deleting label {} from model'.format(label)
+                   + ', because no HMM could be fit')
+    return False
+
+def testModel(hmms, testWindows, statistics):
+    """
+    Classify unkown motion aka test the model that was trained.
+
+    For each test data pair (feature vector + motion label) and each
+    HMM get the likelihood that the HMM would predict the motion label
+    when given the feature vector. The predicted label is then the
+    label associated with the HMM that scores the highest likelihood.
+    """
+    global y_true
+    global y_pred
+    y_true = []
+    y_pred = []
+    for testperson in testWindows:
+        testModelForTestperson(testperson, hmms, testWindows[testperson], statistics)
+
+def testModelForTestperson(testperson, hmms, testWindows, statistics):
+    """
+    Classify unknown motion aka test the model that was trained.
+
+    For each test data pair (feature vector + motion label) and each
+    HMM get the likelihood that the HMM would predict the motion label
+    when given the feature vector. The predicted label is then the
+    label associated with the HMM that scores the highest likelihood.
+    """
+    #global windowsmotion
+    #print len(windowsmotion)
+    #print len(testWindows['y'])
+    #sys.exit()
+    #y_test_curr_motion_old = None
+    #y_test_curr_motion = None
+    #time10ms = 0
+    #k = 0
+    #i = 0
+
+
+    for X_test_curr, y_test_curr in zip(testWindows['X'], testWindows['y']):
+        #y_test_curr_motion = windowsmotion[i]
+        # the score method calculates the loglikelihood
+        scores = [(label, hmm.score(X_test_curr)) for label, hmm in hmms] # scores for each model
+
+        # chose motion with highest score
+        predicted_label = max(scores, key=itemgetter(1))[0] # we choose the motion related to the model that gives the highest probability
+
+
+        """" 
+        DISABLED --> (SOFTMAX)
+        
+        # ADDED
+        # comparison current value vs softmax
+        Directory= Datareader.BASEPATH+"/"+testperson
+        # softmax function applied on y predicted
+        probabilities = compLike.softmax(scores)
+
+        motion_order = compLike.createSoftMaxFile(Directory, scores, probabilities, testperson, y_test_curr) # creation of a file that contains socore values and softmax values (1 line)
+
+        compLike.createComparisonFile(Directory, scores, probabilities, testperson, y_test_curr) # creation of a file that contains socore values and softmax values 3lines
+
+        # end ADDED--> 'comparison current value vs softmax' 
+        
+        """
+
+
+        statistics.report_score(testperson, scores, predicted_label, y_test_curr)
+
+        y_true.append(y_test_curr)
+        y_pred.append(predicted_label)
+        
+        #if k == 0:
+            #if y_test_curr_motion_old == y_test_curr_motion:
+                #if predicted_label == y_test_curr:
+                    #print 'Prediction ' + y_test_curr_motion + ' correct after'
+                    #print time10ms
+                    #k = 1
+                #else:
+                    #time10ms += 20   
+        #if y_test_curr_motion_old != y_test_curr_motion:
+        #    time10ms = 0
+        #    k = 0
+        # compares predicted movement with actual movement
+        if logger.getEffectiveLevel() == logging.INFO:
+            if predicted_label != y_test_curr:
+                col.printout('predicted {}, is {}\n'.format(predicted_label, y_test_curr), col.WHITE)
+                logging.info('predicted {}, is {}\n'.format(predicted_label, y_test_curr))
+            #col.printout('predicted {}, is {}\n'.format(predicted_label, y_test_curr),
+             #            col.RED if predicted_label != y_test_curr else col.WHITE)
+        #y_test_curr_motion_old = y_test_curr_motion
+        #i += 1
+        
+def concatenateWindows(oldWindows, newWindows):
+    assert set(oldWindows.keys()) == set(['X', 'y'])
+    oldWindows['X'] += newWindows['X']
+    if oldWindows['y'].size != 0:
+        oldWindows['y'] = np.hstack((oldWindows['y'], newWindows['y']))
+    else:
+        oldWindows['y'] = newWindows['y']
+
+def prepareLap(lap, foldIndices, windows):
+    """
+    Devide windows into train and test folds according to the index lists train and test.
+
+    Return the train and test folds. The train fold is a list of all training windows for all
+    testpersons, whereas the test fold is a directory containing the test windows for this lap
+    seperated by testperson.
+    """
+    trainWindows = {'X': [], 'y': np.array([])}
+    testWindows = {}
+    for testperson in windows:
+        train, test = splitData(foldIndices[testperson][lap][0],
+                                foldIndices[testperson][lap][1],
+                                windows[testperson])
+        # concatenate the training windows
+        concatenateWindows(trainWindows, train)
+        # save the test windows seperately for each testperson
+        testWindows[testperson] = test
+    assert testWindows.keys() == foldIndices.keys()
+    lenTestWindows = [len(t['X']) for t in testWindows.values()]
+    numTestWindows = reduce(add, lenTestWindows)
+    col.printout('Round {}/{} (Train {}, Test {} (per subject: {})\n'
+                 .format(lap + 1, NUM_FOLDS, len(trainWindows['X']), numTestWindows,
+                         lenTestWindows),
+                 col.WHITE)
+    logging.info('Round {}/{} (Train {}, Test {} (per subject: {})\n'
+                 .format(lap + 1, NUM_FOLDS, len(trainWindows['X']), numTestWindows,
+                         lenTestWindows))
+
+    return (trainWindows, testWindows) # return the windows to train and the windows to test
+
+def runLap((trainWindows, testWindows), statistics): # trainWindows --> windows that will be used for training / testWindows --> windows that will be used for testing
+    hmms = trainModel(trainWindows)
+
+    testModel(hmms, testWindows, statistics)
+
+    return hmms
+
+def getWriteDir(basepath, testpersons, modalities, test_only):
+    """ Create folder to write training data to and add the specification to README.txt. """
+    writeBase = os.path.normpath(basepath + '/MotionPrediction')
+    date = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M')
+    writeDir = os.path.normpath(writeBase + '/' + date) + '/'
+    if not os.path.isdir(writeDir):
+        os.makedirs(writeDir)
+
+    # save parameters of this run in README file
+    with open(writeBase + '/README.txt', 'a') as readme:
+        mods = modalities if modalities else 'all'
+        persons = testpersons if testpersons else 'all'
+        readme.write(date + ' -> modalities: {}, testpersons: {}'.format(
+            mods, persons))
+        if test_only:
+            readme.write(', test results only!')
+        readme.write('\n')
+    return writeDir
+
+def trainAndTest(windows):
+    ''' train  and test HMM with stratified k-fold cross-validation '''
+    # List of all models that are trained. Each model consists of several HMMs.
+    hmmFile = []
+    # provide the statistics for the following test runs with the number of folds and the testperson
+    # names
+    statistics = TrainingStatistics(NUM_FOLDS, windows.keys())
+    labels = ['WalkingForward','WalkingBackward','TurnLeftSmall','TurnRightSmall','LiftObjectUP','DropObject','SidestepsLeft','SidestepsRight','GoingUpstairs','GoingDownstairs','GoingDownstairsBackwards','SitDownArmsCrossed','StandUpArmsCrossed','stand']
+    foldIndices = generateFoldIndices(NUM_FOLDS, windows)
+    for lap in range(NUM_FOLDS):
+        statistics.next_lap()
+        folds = prepareLap(lap, foldIndices, windows)
+        hmms = runLap(folds, statistics)
+        hmmFile.append(hmms)
+
+        ''' Some statistics and debug output '''
+        col.printout('Accuracy per subject: {}\n'.format(statistics.testperson_accuracies(lap)),
+                     col.GREEN)
+        logging.info('Accuracy per subject: {}\n'.format(statistics.testperson_accuracies(lap)))
+
+        col.printout('Total accuracy in this round: {:.2f}%\n'.format(statistics.lap_accuracy(lap)),
+                     col.GREEN)
+        logging.info('Total accuracy in this round: {:.2f}%\n'.format(statistics.lap_accuracy(lap)))
+
+        f1 = f1_score(y_true, y_pred,labels, average=None)
+        print f1
+        logging.info(f1)
+
+        print(classification_report(y_true, y_pred, labels=labels, target_names=labels))
+        logging.info(classification_report(y_true, y_pred, labels=labels, target_names=labels))
+
+    right, wrong = statistics.right_wrong_predictions()
+    alignment = max(len(str(right)), len(str(wrong)))
+    col.printout('\nWrong predictions: {:>{}}\n'.format(wrong, alignment), col.RED)
+    logging.info('\nWrong predictions: {:>{}}\n'.format(wrong, alignment))
+
+    col.printout('Right predictions: {:>{}}\n'.format(right, alignment), col.GREEN)
+    logging.info('Right predictions: {:>{}}\n'.format(right, alignment))
+
+    col.printout('Total hit rate ({} states): {:.2f}%\n'.format(NUM_STATES, \
+                 statistics.total_accuracy()), col.GREEN)
+    logging.info('Total hit rate ({} states): {:.2f}%\n'.format(NUM_STATES, \
+                 statistics.total_accuracy()))
+
+    return (hmmFile, statistics)
+
+def testOnly(windows, readDir):
+    # read the model from file
+    hmms = np.load(os.path.join(readDir, HMM_FILE))
+
+    # initialize statistics
+    statistics = TrainingStatistics(1, windows.keys())
+    statistics.next_lap()
+
+    # test the model on the received windows
+    lenTestWindows = [len(t['X']) for t in windows.values()]
+    numTestWindows = reduce(add, lenTestWindows)
+    col.printout('Testing the model on {} windows (per subject: {}):\n'
+                 .format(numTestWindows, lenTestWindows))
+
+    testModel(hmms, windows, statistics)
+
+    # Some statistics and debug output
+    col.printout('Accuracy per subject: {}\n'.format(statistics.testperson_accuracies(0)),
+                 col.GREEN)
+    col.printout('Total accuracy in this round: {:.2f}%\n'.format(statistics.lap_accuracy(0)),
+                 col.GREEN)
+
+    right, wrong = statistics.right_wrong_predictions()
+    alignment = max(len(str(right)), len(str(wrong)))
+    col.printout('\nWrong predictions: {:>{}}\n'.format(wrong, alignment), col.RED)
+    col.printout('Right predictions: {:>{}}\n'.format(right, alignment), col.GREEN)
+    return statistics
+
+
+def createLogFiles(writeDir, statistics):
+    """ Create files that document this training run. """
+    # create HMMExo_online_Statistic file
+    with open(writeDir + "HMMExo_Train_Test_Statistic.txt", "w") as statistic:
+        statistic.write("Format: ('Predicted', 'TrueValue'): "
+                        + "number of wrong predictions for that lap and testperson \n\n")
+        pairs = statistics.all_prediction_pairs()
+        for (lap, testperson), values in pairs.items():
+            statistic.write("Lap {}, Testperson {}:\n".format(lap, testperson))
+            for stat, number in values:
+                statistic.write('{}: {}x \n'.format(stat, number))
+
+    # create Loglikelihood file
+    with open(writeDir + "Loglikelihood.txt", "w") as loglikeFile:
+        for log in statistics.all_logs():
+            loglikeFile.write("{}\n".format(log))
+
+def saveBestHmm(hmmFile, statistics, writeDir):
+    """ Print some info on the success of the trained HMMs. """
+    # find best HMM
+    hitRatePerIteration = statistics.lap_accuracies()
+    hmmPos = np.argmax(hitRatePerIteration)
+    bestHmm = hmmFile[hmmPos]
+
+    #if logger.getEffectiveLevel() == logging.INFO:
+        # print transition matrix only if INFO level was selected
+    #    for label, hmm in bestHmm:
+    #        col.printout('\nTransition Matrix - {}\n'.format(label), col.BLUE)
+    #        transMatrix = hmm.transmat_
+            # TODO: Replace with numpy output function if result is similiar
+    #        for i in range(0, NUM_STATES):
+    #            print '\t',
+    #            for j in range(0, NUM_STATES):
+    #                print '{0:0.4f}\t'.format(transMatrix[i][j]),
+    #            print ''
+
+    ''' Save the HMM with highest accuracy to use it for online prediction. '''
+    col.printout("hitrateperiter: {}\n".format(hitRatePerIteration))
+    logging.info("hitrateperiter: {}\n".format(hitRatePerIteration))
+
+    col.printout("hmmpos : {}\n".format(hmmPos))
+    logging.info("hmmpos : {}\n".format(hmmPos))
+    np.save(writeDir + HMM_FILE, bestHmm)
+
+def saveScaler(writeDir, scaler):
+    """ Save the scaler so it can be used to scale data for online prediction. """
+    with open(writeDir + '/' + SCALER_FILE, 'wb') as f:
+        pickle.dump(scaler, f)
+
+
+if __name__ == "__main__":
+    args = parseArgs()
+    print ( "modalities: " + str(args.modalities) )
+
+    logger = initLogging(args.loglevel)
+
+    print "started script HMM"
+
+    logging.info(args.modalities)
+
+    logging.info("started script HMM")
+
+    main()
+
+def _perform_fit(model, data):
+    if model is None:
+        return None
+    assert len(data) > 0
+    trainHMM(model, data)
+    return model

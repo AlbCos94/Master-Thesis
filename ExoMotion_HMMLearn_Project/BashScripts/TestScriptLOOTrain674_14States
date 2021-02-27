@@ -1,0 +1,8 @@
+#!/bin/bash
+#
+
+python Motion_Datareader_Train_Test_Debug.py -b '/common/share/Vicon_Data/Vicon/PassiveExo/HMMTest/ALL_Interpoliert/674/' -w 300
+python HMMExo_Train_Test.py -b '/common/share/Vicon_Data/Vicon/PassiveExo/HMMTest/ALL_Interpoliert/674/' -t 917,1717,1718,1719,1720,1722,1723,1724,1725 -l info -s14 -m WalkingForward,WalkingBackward,TurnLeftSmall,TurnRightSmall,LiftObjectUP,DropObject,SidestepsLeft,SidestepsRight,GoingUpstairs,GoingDownstairs,GoingDownstairsBackwards,SitDownArmsCrossed,StandUpArmsCrossed ZMD IMU=l,e  > LogFiles/674_Results_LOO_Train_14States_ws300.log
+echo "Subject 674: EndTraining"
+
+
